@@ -1,0 +1,31 @@
+---
+# Base config for every managed node: updates, essentials, timezone.
+- name: Base configuration
+  hosts: all
+  become: true
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install essential packages
+      ansible.builtin.apt:
+        name:
+          - curl
+          - git
+          - htop
+          - vim
+          - unattended-upgrades
+        state: present
+
+    - name: Set timezone
+      community.general.timezone:
+        name: America/New_York
+
+    - name: Enable unattended security upgrades (Debian-family)
+      ansible.builtin.service:
+        name: unattended-upgrades
+        enabled: true
+        state: started
+      when: ansible_os_family == "Debian"

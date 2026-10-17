@@ -1,0 +1,31 @@
+---
+# Tailscale on every node. Subnet routers advertise their site LAN —
+# approve routes in the Tailscale admin console afterwards.
+- name: Install and configure Tailscale
+  hosts: all
+  become: true
+  vars:
+    # Generate at https://login.tailscale.com/admin/settings/keys (reusable, tagged)
+    tailscale_authkey: "tskey-auth-PLACEHOLDER"
+    lan_subnet: "192.168.1.0/24"
+  tasks:
+    - name: Enable IPv4 forwarding (required for subnet routing)
+      ansible.builtin.sysctl:
+        name: net.ipv4.ip_forward
+        value: "1"
+        sysctl_set: true
+        reload: true
+      when: node_role == 'subnet-router'
+
+    - name: Install Tailscale
+      ansible.builtin.shell:
+        cmd: curl -fsSL https://tailscale.com/install.sh | sh
+        creates: /usr/bin/tailscale
+
+    - name: Bring up Tailscale (advertise routes on subnet routers)
+      ansible.builtin.command:
+        cmd: >-
+          tailscale up --authkey={{ tailscale_authkey }}
+          {{ '--advertise-routes=' + lan_subnet if node_role == 'subnet-router' else '' }}
+      changed_when: false
+      # tailscale up is idempotent; re-running is safe

@@ -1,0 +1,281 @@
+# Arr stack — real compose (secrets via .env, never committed)
+# Design: Gluetun VPN kill-switch. Torrent traffic (qBittorrent, Prowlarr,
+# FlareSolverr) rides the tunnel via network_mode: service:gluetun.
+# Media managers and Jellyfin stay direct for speed and LAN access.
+# Static IPs on a custom network keep the layout deterministic.
+# NOTE: services using network_mode: service:gluetun share Gluetun's network
+# namespace — they resolve each other via localhost, not the static IPs.
+
+networks:
+  arrnetwork:
+    name: arrnetwork
+    ipam:
+      config:
+        - subnet: 172.39.0.0/24
+
+services:
+
+  # ============================================================
+  # GLUETUN — VPN container (kill switch + tunnel)
+  # Ports for tunneled services are mapped HERE, not on the
+  # services themselves.
+  # Docs: https://github.com/qdm12/gluetun-wiki
+  # ============================================================
+  gluetun:
+    image: qmcgaw/gluetun:latest
+    container_name: gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    networks:
+      arrnetwork:
+        ipv4_address: ${IP_GLUETUN}
+    ports:
+      - 8080:8080     # qBittorrent WebUI
+      - 6881:6881     # qBittorrent torrenting port
+      - 6881:6881/udp
+      - 9696:9696     # Prowlarr
+      - 8191:8191     # FlareSolverr
+    volumes:
+      - ./gluetun:/gluetun
+    environment:
+      - VPN_SERVICE_PROVIDER=${VPN_SERVICE_PROVIDER}
+      - VPN_TYPE=${VPN_TYPE}
+      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
+      - WIREGUARD_ADDRESSES=${WIREGUARD_ADDRESSES}
+      - WIREGUARD_PUBLIC_KEY=${WIREGUARD_PUBLIC_KEY}
+      - WIREGUARD_PRESHARED_KEY=${WIREGUARD_PRESHARED_KEY}
+      - OPENVPN_USER=${OPENVPN_USER}
+      - OPENVPN_PASSWORD=${OPENVPN_PASSWORD}
+      - SERVER_COUNTRIES=${SERVER_COUNTRIES}
+      - VPN_PORT_FORWARDING=${VPN_PORT_FORWARDING}
+      - FIREWALL_VPN_INPUT_PORTS=${FIREWALL_VPN_INPUT_PORTS}
+      - TZ=${TZ}
+    healthcheck:
+      test: wget -qO /dev/null http://127.0.0.1:9999 || exit 1
+      interval: 20s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # ============================================================
+  # QBITTORRENT — torrent client (through Gluetun)
+  # Only starts when gluetun is healthy. Deunhealth restarts it
+  # automatically if the tunnel drops.
+  # ============================================================
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    network_mode: service:gluetun
+    depends_on:
+      gluetun:
+        condition: service_healthy
+        restart: true
+    labels:
+      - deunhealth.restart.on.unhealthy=true
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - UMASK=002
+      - TZ=${TZ}
+      - WEBUI_PORT=8080
+      - TORRENTING_PORT=${FIREWALL_VPN_INPUT_PORTS}
+    volumes:
+      - ./qbittorrent:/config
+      - /data:/data
+    healthcheck:
+      test: wget -q --spider http://localhost:8080 || exit 1
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  # ============================================================
+  # DEUNHEALTH — restarts unhealthy containers automatically
+  # ============================================================
+  deunhealth:
+    image: qmcgaw/deunhealth
+    container_name: deunhealth
+    network_mode: none
+    environment:
+      - LOG_LEVEL=info
+      - TZ=${TZ}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: always
+
+  # ============================================================
+  # PROWLARR — indexer manager (through Gluetun)
+  # ============================================================
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    network_mode: service:gluetun
+    depends_on:
+      gluetun:
+        condition: service_healthy
+        restart: true
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - UMASK=002
+      - TZ=${TZ}
+    volumes:
+      - ./prowlarr:/config
+    restart: unless-stopped
+
+  # ============================================================
+  # FLARESOLVERR — Cloudflare bypass (through Gluetun)
+  # ============================================================
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    network_mode: service:gluetun
+    depends_on:
+      gluetun:
+        condition: service_healthy
+        restart: true
+    environment:
+      - LOG_LEVEL=info
+      - TZ=${TZ}
+    restart: unless-stopped
+
+  # ============================================================
+  # RADARR / SONARR / LIDARR — media managers (NOT behind VPN)
+  # They talk to Prowlarr and hand downloads to qBittorrent;
+  # they need direct network access for speed and LAN connectivity.
+  # ============================================================
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - UMASK=002
+      - TZ=${TZ}
+    volumes:
+      - ./radarr:/config
+      - /data:/data
+    ports:
+      - 7878:7878
+    networks:
+      arrnetwork:
+        ipv4_address: ${IP_RADARR}
+    restart: unless-stopped
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - UMASK=002
+      - TZ=${TZ}
+    volumes:
+      - ./sonarr:/config
+      - /data:/data
+    ports:
+      - 8989:8989
+    networks:
+      arrnetwork:
+        ipv4_address: ${IP_SONARR}
+    restart: unless-stopped
+
+  lidarr:
+    image: lscr.io/linuxserver/lidarr:latest
+    container_name: lidarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - UMASK=002
+      - TZ=${TZ}
+    volumes:
+      - ./lidarr:/config
+      - /data:/data
+    ports:
+      - 8686:8686
+    networks:
+      arrnetwork:
+        ipv4_address: ${IP_LIDARR}
+    restart: unless-stopped
+
+  # ============================================================
+  # BAZARR — subtitle manager (NOT behind VPN)
+  # ============================================================
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - UMASK=002
+      - TZ=${TZ}
+    volumes:
+      - ./bazarr:/config
+      - /data:/data
+    ports:
+      - 6767:6767
+    networks:
+      arrnetwork:
+        ipv4_address: ${IP_BAZARR}
+    restart: unless-stopped
+
+  # ============================================================
+  # JELLYFIN — media server (NOT behind VPN)
+  # Needs full bandwidth — never put it behind the tunnel.
+  # Uncomment /dev/dri for Intel QuickSync transcoding.
+  # ============================================================
+  jellyfin:
+    image: lscr.io/linuxserver/jellyfin:latest
+    container_name: jellyfin
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - UMASK=002
+      - TZ=${TZ}
+    volumes:
+      - ./jellyfin:/config
+      - /data/media:/data/media
+    ports:
+      - 8096:8096
+    # devices:
+    #   - /dev/dri:/dev/dri
+    networks:
+      arrnetwork:
+        ipv4_address: ${IP_JELLYFIN}
+    restart: unless-stopped
+
+  # ============================================================
+  # SEERR — request system (NOT behind VPN)
+  # Family-facing UI for requesting movies/shows.
+  # NOTE: Seerr runs as UID 1000 — use a NAMED volume for its
+  # config, not a bind mount (bind mounts go root-owned and crash
+  # it with permission errors).
+  # ============================================================
+  seerr:
+    image: ghcr.io/seerr-team/seerr
+    init: true
+    container_name: seerr
+    environment:
+      - LOG_LEVEL=info
+      - TZ=${TZ}
+      - PORT=5055
+    volumes:
+      - seerr_config:/app/config
+    ports:
+      - 5055:5055
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:5055/api/v1/settings/public || exit 1
+      start_period: 20s
+      timeout: 3s
+      interval: 15s
+      retries: 3
+    networks:
+      arrnetwork:
+        ipv4_address: ${IP_SEERR}
+    restart: unless-stopped
+
+volumes:
+  seerr_config:
